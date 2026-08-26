@@ -1,0 +1,69 @@
+# Dependencies
+node_modules/
+vendor/
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# Build / compiled files
+dist/
+build/
+out/
+*.pyc
+__pycache__/
+
+# Logs
+*.log
+logs/
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.cache
+
+# Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# Database
+*.sqlite
+*.sqlite3
+*.db
+
+# Coverage
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Secrets / certificates
+*.pem
+*.key
+*.crt
+
+# Backup files
+*.bak
+*.old
+*~
+
+# Generated files
+*.zip
+*.tar
+*.gz
