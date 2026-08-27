@@ -166,6 +166,60 @@ class VisitInput(BaseModel):
     development_notes: str = ""
 
 
+PERMISSIONS = [
+    "cinus.overview", "cinus.children", "cinus.visit", "cinus.report",
+    "rh.clients", "rh.anc", "rh.labor", "rh.postpartum", "rh.report",
+    "admin.users",
+]
+
+
+class LoginInput(BaseModel):
+    username: str
+    password: str
+
+
+class UserInput(BaseModel):
+    username: str
+    full_name: str
+    password: str = ""
+    role: str = "physician"
+    permissions: list[str] = []
+    active: bool = True
+
+
+def current_user(request: Request | None = None) -> dict[str, Any]:
+    username = request.headers.get("X-User", "admin") if request else "admin"
+    with closing(db()) as connection:
+        row = connection.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    if not row:
+        return {"username": "admin", "full_name": "System administrator", "role": "admin", "permissions": ["admin.users"]}
+    user = dict(row)
+    user["permissions"] = json.loads(user.get("permissions") or "[]")
+    return user
+
+
+def public_user(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+    user = dict(row)
+    user.pop("password", None)
+    user["permissions"] = json.loads(user.get("permissions") or "[]")
+    user["active"] = bool(user.get("active", 1))
+    return user
+
+
+def require_permission(request: Request, permission: str) -> dict[str, Any]:
+    user = current_user(request)
+    if permission not in user.get("permissions", []):
+        raise HTTPException(403, "You do not have permission for this action.")
+    return user
+
+
+def log_action(connection: sqlite3.Connection, user: dict[str, Any], action: str, target_type: str, target_id: int | None = None, detail: str = "") -> None:
+    connection.execute(
+        "INSERT INTO audit_logs (username,full_name,role,action,target_type,target_id,detail,created_at) VALUES (?,?,?,?,?,?,?,?)",
+        (user.get("username", ""), user.get("full_name", ""), user.get("role", ""), action, target_type, target_id, detail, datetime.now().isoformat(timespec="seconds")),
+    )
+
+
 def db() -> sqlite3.Connection:
     connection = sqlite3.connect(DATABASE)
     connection.row_factory = sqlite3.Row
@@ -434,8 +488,42 @@ def init_db() -> None:
               id INTEGER PRIMARY KEY AUTOINCREMENT, child_id INTEGER NOT NULL, visit_id INTEGER UNIQUE, date TEXT NOT NULL,
               result TEXT NOT NULL, notes TEXT, FOREIGN KEY(child_id) REFERENCES children(id), FOREIGN KEY(visit_id) REFERENCES visits(id)
             );
+            CREATE TABLE IF NOT EXISTS users (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
+              full_name TEXT NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL,
+              permissions TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+              created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS audit_logs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL,
+              full_name TEXT NOT NULL, role TEXT, action TEXT NOT NULL,
+              target_type TEXT NOT NULL, target_id INTEGER, detail TEXT,
+              created_at TEXT NOT NULL
+            );
             """
         )
+        for statement in [
+            "ALTER TABLE children ADD COLUMN recorded_by TEXT",
+            "ALTER TABLE visits ADD COLUMN recorded_by TEXT",
+            "ALTER TABLE rh_cards ADD COLUMN recorded_by TEXT",
+        ]:
+            try:
+                connection.execute(statement)
+            except sqlite3.OperationalError:
+                pass
+        if connection.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+            now = datetime.now().isoformat(timespec="seconds")
+            users = [
+                ("admin", "System administrator", "@admin365", "admin", json.dumps(["admin.users"]), 1, now, now),
+                ("child_reg", "Child registrar", "child123", "physician", json.dumps(["cinus.overview", "cinus.children"]), 1, now, now),
+                ("followup", "CINUS follow-up worker", "follow123", "physician", json.dumps(["cinus.overview", "cinus.visit"]), 1, now, now),
+                ("reporter", "CINUS reporter", "report123", "physician", json.dumps(["cinus.overview", "cinus.report"]), 1, now, now),
+                ("anc", "ANC provider", "anc123", "physician", json.dumps(["rh.clients", "rh.anc"]), 1, now, now),
+                ("delivery", "Delivery provider", "delivery123", "physician", json.dumps(["rh.labor"]), 1, now, now),
+                ("postpartum", "Postpartum provider", "post123", "physician", json.dumps(["rh.postpartum"]), 1, now, now),
+            ]
+            connection.executemany("INSERT INTO users (username,full_name,password,role,permissions,active,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)", users)
+        connection.execute("UPDATE users SET permissions=?, role='admin' WHERE username='admin'", (json.dumps(["admin.users"]),))
         if connection.execute("SELECT COUNT(*) FROM patients").fetchone()[0] == 0:
             now = datetime.now().isoformat(timespec="seconds")
             patients = [
@@ -515,6 +603,88 @@ def startup() -> None:
     init_db()
 
 
+@app.post("/api/login")
+def login(credentials: LoginInput) -> dict[str, Any]:
+    with closing(db()) as connection:
+        row = connection.execute("SELECT * FROM users WHERE username=? AND active=1", (credentials.username.strip(),)).fetchone()
+        if row and row["password"] == credentials.password:
+            log_action(connection, public_user(row), "login", "session", None, "Signed in")
+            connection.commit()
+    if not row or row["password"] != credentials.password:
+        raise HTTPException(401, "That sign-in did not match. Check your details and try again.")
+    return public_user(row)
+
+
+@app.get("/api/users")
+def list_users(request: Request) -> list[dict[str, Any]]:
+    require_permission(request, "admin.users")
+    return [public_user(row) for row in rows("SELECT * FROM users ORDER BY role, full_name")]
+
+
+@app.post("/api/users", status_code=201)
+def create_user(user: UserInput, request: Request) -> dict[str, Any]:
+    require_permission(request, "admin.users")
+    now = datetime.now().isoformat(timespec="seconds")
+    password = user.password or "change123"
+    permissions = ["admin.users"] if user.role == "admin" or user.username.strip() == "admin" else [p for p in user.permissions if p in PERMISSIONS and p != "admin.users"]
+    with closing(db()) as connection:
+        cursor = connection.execute("INSERT INTO users (username,full_name,password,role,permissions,active,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)", (user.username.strip(), user.full_name, password, user.role, json.dumps(permissions), int(user.active), now, now))
+        log_action(connection, current_user(request), "create_user", "user", cursor.lastrowid, user.username.strip())
+        connection.commit()
+        return public_user(connection.execute("SELECT * FROM users WHERE id=?", (cursor.lastrowid,)).fetchone())
+
+
+@app.put("/api/users/{user_id}")
+def update_user(user_id: int, user: UserInput, request: Request) -> dict[str, Any]:
+    require_permission(request, "admin.users")
+    now = datetime.now().isoformat(timespec="seconds")
+    permissions = ["admin.users"] if user.role == "admin" or user.username.strip() == "admin" else [p for p in user.permissions if p in PERMISSIONS and p != "admin.users"]
+    with closing(db()) as connection:
+        existing = connection.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if not existing:
+            raise HTTPException(404, "User not found")
+        password = user.password or existing["password"]
+        connection.execute("UPDATE users SET username=?,full_name=?,password=?,role=?,permissions=?,active=?,updated_at=? WHERE id=?", (user.username.strip(), user.full_name, password, user.role, json.dumps(permissions), int(user.active), now, user_id))
+        log_action(connection, current_user(request), "update_user", "user", user_id, user.username.strip())
+        connection.commit()
+        return public_user(connection.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone())
+
+
+@app.get("/api/audit-summary")
+def audit_summary(request: Request) -> dict[str, Any]:
+    require_permission(request, "admin.users")
+    with closing(db()) as connection:
+        users = [public_user(row) for row in connection.execute("SELECT * FROM users ORDER BY role, full_name").fetchall()]
+        child_counts = {row["recorded_by"] or "Unassigned": row["total"] for row in connection.execute("SELECT recorded_by, COUNT(*) total FROM children GROUP BY recorded_by").fetchall()}
+        visit_counts = {row["recorded_by"] or "Unassigned": row["total"] for row in connection.execute("SELECT recorded_by, COUNT(*) total FROM visits GROUP BY recorded_by").fetchall()}
+        rh_counts = {row["recorded_by"] or "Unassigned": row["total"] for row in connection.execute("SELECT recorded_by, COUNT(*) total FROM rh_cards GROUP BY recorded_by").fetchall()}
+        logs = [dict(row) for row in connection.execute("SELECT * FROM audit_logs ORDER BY id DESC LIMIT 80").fetchall()]
+    names = sorted(set(child_counts) | set(visit_counts) | set(rh_counts) | {u["full_name"] for u in users})
+    by_user = [
+        {
+            "name": name,
+            "children": child_counts.get(name, 0),
+            "visits": visit_counts.get(name, 0),
+            "rh_cards": rh_counts.get(name, 0),
+            "total": child_counts.get(name, 0) + visit_counts.get(name, 0) + rh_counts.get(name, 0),
+        }
+        for name in names
+    ]
+    return {
+        "users": users,
+        "summary": sorted(by_user, key=lambda row: row["total"], reverse=True),
+        "recent_actions": logs,
+        "totals": {
+            "users": len(users),
+            "active_users": len([u for u in users if u["active"]]),
+            "children": sum(child_counts.values()),
+            "visits": sum(visit_counts.values()),
+            "rh_cards": sum(rh_counts.values()),
+            "actions": len(logs),
+        },
+    }
+
+
 @app.get("/api/dashboard")
 def dashboard() -> dict[str, Any]:
     patient_count = rows("SELECT COUNT(*) AS count FROM patients")[0]["count"]
@@ -573,6 +743,21 @@ def decode_rh_card(row: dict[str, Any]) -> dict[str, Any]:
     payload = json.loads(row.pop("payload"))
     return {**row, **payload}
 
+def stamp_rh_payload(payload: dict[str, Any], user: dict[str, Any]) -> dict[str, Any]:
+    sections = payload.setdefault("sections", {})
+    meta = sections.setdefault("_meta", {})
+    now = datetime.now().isoformat(timespec="seconds")
+    meta["last_recorded_by"] = user["full_name"]
+    meta["last_recorded_at"] = now
+    for contact in range(1, 9):
+        prefix = str(contact)
+        if any(k.startswith(prefix) and str(v).strip() for k, v in (sections.get("anc") or {}).items()):
+            meta.setdefault("anc_recorded_by", {}).setdefault(prefix, {"name": user["full_name"], "at": now})
+    for key in ("labor", "delivery", "postpartum", "birth_notification"):
+        if any(str(v).strip() for v in (sections.get(key) or {}).values() if not isinstance(v, list)) or any(v for v in (sections.get(key) or {}).values() if isinstance(v, list)):
+            meta.setdefault("section_recorded_by", {})[key] = {"name": user["full_name"], "at": now}
+    return payload
+
 @app.get("/api/rh-cards")
 def list_rh_cards() -> list[dict[str, Any]]:
     return [decode_rh_card(item) for item in rows("SELECT * FROM rh_cards ORDER BY updated_at DESC")]
@@ -585,21 +770,28 @@ def get_rh_card(card_id: int) -> dict[str, Any]:
     return decode_rh_card(found[0])
 
 @app.post("/api/rh-cards", status_code=201)
-def create_rh_card(card: RHCardInput) -> dict[str, Any]:
+def create_rh_card(card: RHCardInput, request: Request) -> dict[str, Any]:
     now = datetime.now().isoformat(timespec="seconds")
+    user = current_user(request)
+    payload = stamp_rh_payload(card.model_dump(), user)
     with closing(db()) as connection:
         try:
-            cursor = connection.execute("INSERT INTO rh_cards (mrn,client_name,facility_name,card_date,payload,created_at,updated_at) VALUES (?,?,?,?,?,?,?)", (card.mrn,card.client_name,card.facility_name,card.card_date,card.model_dump_json(),now,now))
+            cursor = connection.execute("INSERT INTO rh_cards (mrn,client_name,facility_name,card_date,payload,created_at,updated_at,recorded_by) VALUES (?,?,?,?,?,?,?,?)", (card.mrn,card.client_name,card.facility_name,card.card_date,json.dumps(payload),now,now,user["full_name"]))
+            log_action(connection, user, "create_rh_card", "rh_card", cursor.lastrowid, card.client_name)
         except sqlite3.IntegrityError:
             raise HTTPException(409, "An RH card with this MRN already exists")
         connection.commit()
         return {"id": cursor.lastrowid, "message": "Maternal RH card created"}
 
 @app.put("/api/rh-cards/{card_id}")
-def update_rh_card(card_id: int, card: RHCardInput) -> dict[str, Any]:
+def update_rh_card(card_id: int, card: RHCardInput, request: Request) -> dict[str, Any]:
     now = datetime.now().isoformat(timespec="seconds")
+    user = current_user(request)
+    payload = stamp_rh_payload(card.model_dump(), user)
     with closing(db()) as connection:
-        cursor = connection.execute("UPDATE rh_cards SET mrn=?,client_name=?,facility_name=?,card_date=?,payload=?,updated_at=? WHERE id=?", (card.mrn,card.client_name,card.facility_name,card.card_date,card.model_dump_json(),now,card_id))
+        cursor = connection.execute("UPDATE rh_cards SET mrn=?,client_name=?,facility_name=?,card_date=?,payload=?,updated_at=?,recorded_by=? WHERE id=?", (card.mrn,card.client_name,card.facility_name,card.card_date,json.dumps(payload),now,user["full_name"],card_id))
+        if cursor.rowcount:
+            log_action(connection, user, "update_rh_card", "rh_card", card_id, card.client_name)
         if not cursor.rowcount: raise HTTPException(404, "Maternal RH card not found")
         connection.commit()
     return {"id": card_id, "message": "Maternal RH card updated"}
@@ -1468,14 +1660,39 @@ def calculate_growth_scores(sex: str, dob: str, visit_date: str, weight: float, 
         observation = Observation(sex=sex.lower(), dob=date.fromisoformat(dob), date_of_observation=date.fromisoformat(visit_date))
         recumbent = age_days < 731
         if recumbent and not 45 <= height <= 110:
-            raise HTTPException(422, "For children under 24 months, length must be between 45 and 110 cm for WHO WHZ calculation.")
+            raise HTTPException(422, "For children under 24 months, length must be between 45 and 110 cm for WHO weight-for-length z-score calculation.")
         if not recumbent and not 65 <= height <= 120:
-            raise HTTPException(422, "For children aged 24 months or older, height must be between 65 and 120 cm for WHO WHZ calculation.")
+            raise HTTPException(422, "For children aged 24 months or older, height must be between 65 and 120 cm for WHO weight-for-height z-score calculation.")
         haz = observation.length_or_height_for_age(height, recumbent=recumbent)
         whz = observation.weight_for_length(weight, height) if recumbent else observation.weight_for_height(weight, height)
         return {"waz": float(round(observation.weight_for_age(weight), 2)), "haz": float(round(haz, 2)), "whz": float(round(whz, 2))}
     except (PyGrowUpException, ValueError, TypeError) as error:
         raise HTTPException(422, f"Check measurements: {error}. Enter length/height in centimetres, for example 50, 71.5 or 92.") from error
+
+
+def validate_child_dose(connection: sqlite3.Connection, table: str, child_id: int, visit_date: str, age: int, current_visit_id: int | None = None) -> None:
+    if table == "vitamin_a":
+        if not 6 <= age <= 59:
+            raise HTTPException(422, "Vitamin A may be recorded in this CINUS form only for children aged 6-59 months")
+        label, minimum_days, yearly_limit = "Vitamin A", 120, 2
+    elif table == "deworming":
+        if not 24 <= age <= 59:
+            raise HTTPException(422, "Deworming may be recorded in this CINUS form only for children aged 24-59 months")
+        label, minimum_days, yearly_limit = "Deworming", 365, 2
+    else:
+        raise HTTPException(500, "Unknown child service dose")
+    params: list[Any] = [child_id]
+    ignore_current = ""
+    if current_visit_id is not None:
+        ignore_current = " AND visit_id<>?"
+        params.append(current_visit_id)
+    year = date.fromisoformat(visit_date).year
+    year_count = connection.execute(f"SELECT COUNT(*) FROM {table} WHERE child_id=?{ignore_current} AND substr(date_given,1,4)=?", (*params, str(year))).fetchone()[0]
+    if year_count >= yearly_limit:
+        raise HTTPException(422, f"{label} already has two records in {year}. Record the next dose in a new year if the child remains eligible.")
+    previous = connection.execute(f"SELECT date_given FROM {table} WHERE child_id=?{ignore_current} ORDER BY date_given DESC LIMIT 1", tuple(params)).fetchone()
+    if previous and (date.fromisoformat(visit_date) - date.fromisoformat(previous["date_given"])).days < minimum_days:
+        raise HTTPException(422, f"{label} was already recorded too recently. Check the child's service history.")
 
 
 @app.get("/api/children")
@@ -1484,23 +1701,27 @@ def list_children() -> list[dict[str, Any]]:
 
 
 @app.post("/api/children", status_code=201)
-def create_child(child: ChildInput) -> dict[str, Any]:
+def create_child(child: ChildInput, request: Request) -> dict[str, Any]:
     now = datetime.now().isoformat(timespec="seconds")
+    user = current_user(request)
     with closing(db()) as connection:
         next_number = connection.execute("SELECT COUNT(*) FROM children").fetchone()[0] + 1
         code = f"CIN-{date.today().year}-{next_number:04d}"
-        cursor = connection.execute("INSERT INTO children (child_code,first_name,last_name,sex,date_of_birth,mother_name,phone,region,woreda,kebele,household_id,registration_date) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (code, *child.model_dump().values(), now))
+        cursor = connection.execute("INSERT INTO children (child_code,first_name,last_name,sex,date_of_birth,mother_name,phone,region,woreda,kebele,household_id,registration_date,recorded_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (code, *child.model_dump().values(), now, user["full_name"]))
+        log_action(connection, user, "create_child", "child", cursor.lastrowid, f"{child.first_name} {child.last_name}")
         connection.commit()
         return dict(connection.execute("SELECT * FROM children WHERE id=?", (cursor.lastrowid,)).fetchone())
 
 
 @app.put("/api/children/{child_id}")
-def update_child(child_id: int, child: ChildInput) -> dict[str, Any]:
+def update_child(child_id: int, child: ChildInput, request: Request) -> dict[str, Any]:
+    user = current_user(request)
     with closing(db()) as connection:
         existing = connection.execute("SELECT id FROM children WHERE id=?", (child_id,)).fetchone()
         if not existing:
             raise HTTPException(404, "Child not found")
-        connection.execute("""UPDATE children SET first_name=?,last_name=?,sex=?,date_of_birth=?,mother_name=?,phone=?,region=?,woreda=?,kebele=?,household_id=? WHERE id=?""", (*child.model_dump().values(), child_id))
+        connection.execute("""UPDATE children SET first_name=?,last_name=?,sex=?,date_of_birth=?,mother_name=?,phone=?,region=?,woreda=?,kebele=?,household_id=?,recorded_by=? WHERE id=?""", (*child.model_dump().values(), user["full_name"], child_id))
+        log_action(connection, user, "update_child", "child", child_id, f"{child.first_name} {child.last_name}")
         connection.commit()
         return dict(connection.execute("SELECT * FROM children WHERE id=?", (child_id,)).fetchone())
 
@@ -1535,7 +1756,8 @@ def child_history(child_id: int) -> list[dict[str, Any]]:
 
 
 @app.post("/api/visits", status_code=201)
-def create_visit(item: VisitInput) -> dict[str, Any]:
+def create_visit(item: VisitInput, request: Request) -> dict[str, Any]:
+    user = current_user(request)
     with closing(db()) as connection:
         child = connection.execute("SELECT * FROM children WHERE id=?", (item.child_id,)).fetchone()
         if not child: raise HTTPException(404, "Child not found")
@@ -1543,49 +1765,48 @@ def create_visit(item: VisitInput) -> dict[str, Any]:
         if not 0 <= age <= 59: raise HTTPException(422, "CINUS is for children aged 0-59 months")
         scores = calculate_growth_scores(child["sex"], child["date_of_birth"], item.visit_date, item.weight, item.height)
         now = datetime.now().isoformat(timespec="seconds")
-        visit = connection.execute("INSERT INTO visits (child_id,visit_date,age_months,weight,height,muac,edema,health_worker,created_at) VALUES (?,?,?,?,?,?,?,?,?)", (item.child_id,item.visit_date,age,item.weight,item.height,item.muac,int(item.edema),item.health_worker,now))
+        worker = item.health_worker or user["full_name"]
+        visit = connection.execute("INSERT INTO visits (child_id,visit_date,age_months,weight,height,muac,edema,health_worker,created_at,recorded_by) VALUES (?,?,?,?,?,?,?,?,?,?)", (item.child_id,item.visit_date,age,item.weight,item.height,item.muac,int(item.edema),worker,now,user["full_name"]))
         visit_id = visit.lastrowid
+        log_action(connection, user, "create_visit", "visit", visit_id, f"Child {item.child_id} on {item.visit_date}")
         connection.execute("INSERT INTO growth_assessments (visit_id,waz,haz,whz,underweight_status,stunting_status,wasting_status,generated_at) VALUES (?,?,?,?,?,?,?,?)", (visit_id,scores["waz"],scores["haz"],scores["whz"],z_status(scores["waz"],"Normal","Moderate underweight","Severe underweight"),z_status(scores["haz"],"Normal","Moderate stunting","Severe stunting"),z_status(scores["whz"],"Normal","Moderate wasting","Severe wasting"),now))
         # Bilateral pitting oedema is an independent SAM criterion and overrides a manual screen selection.
         nutrition_result = "sam" if item.edema else item.nutrition_result
         connection.execute("INSERT INTO nutrition_screenings (visit_id,screening_date,result,referral) VALUES (?,?,?,?)", (visit_id,item.visit_date,nutrition_result,item.referral))
         if item.vitamin_a_dose:
-            if not 6 <= age <= 59: raise HTTPException(422, "Vitamin A may be recorded in this CINUS form only for children aged 6-59 months")
-            previous = connection.execute("SELECT date_given FROM vitamin_a WHERE child_id=? ORDER BY date_given DESC LIMIT 1", (item.child_id,)).fetchone()
-            if previous and (date.fromisoformat(item.visit_date) - date.fromisoformat(previous["date_given"])).days < 120:
-                raise HTTPException(422, "Vitamin A was already recorded within the last 4 months. Check the child's service history.")
-            connection.execute("INSERT INTO vitamin_a (child_id,visit_id,dose_number,date_given,provider) VALUES (?,?,?,?,?)", (item.child_id,visit_id,item.vitamin_a_dose,item.visit_date,item.health_worker))
+            validate_child_dose(connection, "vitamin_a", item.child_id, item.visit_date, age)
+            connection.execute("INSERT INTO vitamin_a (child_id,visit_id,dose_number,date_given,provider) VALUES (?,?,?,?,?)", (item.child_id,visit_id,item.vitamin_a_dose,item.visit_date,worker))
         if item.deworming_dose:
-            if not 24 <= age <= 59: raise HTTPException(422, "Deworming may be recorded in this CINUS form only for children aged 24-59 months")
-            previous = connection.execute("SELECT date_given FROM deworming WHERE child_id=? ORDER BY date_given DESC LIMIT 1", (item.child_id,)).fetchone()
-            if previous and (date.fromisoformat(item.visit_date) - date.fromisoformat(previous["date_given"])).days < 365:
-                raise HTTPException(422, "Deworming was already recorded within the last 12 months. Check the child's service history.")
-            connection.execute("INSERT INTO deworming (child_id,visit_id,dose_number,date_given,provider) VALUES (?,?,?,?,?)", (item.child_id,visit_id,item.deworming_dose,item.visit_date,item.health_worker))
+            validate_child_dose(connection, "deworming", item.child_id, item.visit_date, age)
+            connection.execute("INSERT INTO deworming (child_id,visit_id,dose_number,date_given,provider) VALUES (?,?,?,?,?)", (item.child_id,visit_id,item.deworming_dose,item.visit_date,worker))
         connection.execute("INSERT INTO development_screenings (child_id,visit_id,date,result,notes) VALUES (?,?,?,?,?)", (item.child_id,visit_id,item.visit_date,item.developmental_result,item.development_notes))
         connection.commit()
     return {"id": visit_id, "age_months": age, "scores": scores, "message": "Child visit and all linked CINUS records saved"}
 
 
 @app.put("/api/visits/{visit_id}")
-def update_visit(visit_id: int, item: VisitInput) -> dict[str, Any]:
+def update_visit(visit_id: int, item: VisitInput, request: Request) -> dict[str, Any]:
+    user = current_user(request)
     with closing(db()) as connection:
         existing = connection.execute("SELECT id FROM visits WHERE id=? AND child_id=?", (visit_id, item.child_id)).fetchone()
         child = connection.execute("SELECT * FROM children WHERE id=?", (item.child_id,)).fetchone()
         if not existing or not child: raise HTTPException(404, "Visit or child not found")
         age = age_in_months(child["date_of_birth"], item.visit_date)
         if not 0 <= age <= 59: raise HTTPException(422, "CINUS is for children aged 0-59 months")
-        if item.vitamin_a_dose and not 6 <= age <= 59: raise HTTPException(422, "Vitamin A is available for children aged 6-59 months")
-        if item.deworming_dose and not 24 <= age <= 59: raise HTTPException(422, "Deworming is available for children aged 24-59 months")
+        if item.vitamin_a_dose: validate_child_dose(connection, "vitamin_a", item.child_id, item.visit_date, age, visit_id)
+        if item.deworming_dose: validate_child_dose(connection, "deworming", item.child_id, item.visit_date, age, visit_id)
         scores = calculate_growth_scores(child["sex"], child["date_of_birth"], item.visit_date, item.weight, item.height)
         now = datetime.now().isoformat(timespec="seconds")
-        connection.execute("UPDATE visits SET visit_date=?,age_months=?,weight=?,height=?,muac=?,edema=?,health_worker=? WHERE id=?", (item.visit_date,age,item.weight,item.height,item.muac,int(item.edema),item.health_worker,visit_id))
+        worker = item.health_worker or user["full_name"]
+        connection.execute("UPDATE visits SET visit_date=?,age_months=?,weight=?,height=?,muac=?,edema=?,health_worker=?,recorded_by=? WHERE id=?", (item.visit_date,age,item.weight,item.height,item.muac,int(item.edema),worker,user["full_name"],visit_id))
+        log_action(connection, user, "update_visit", "visit", visit_id, f"Child {item.child_id} on {item.visit_date}")
         for table in ("growth_assessments","nutrition_screenings","vitamin_a","deworming","development_screenings"):
             connection.execute(f"DELETE FROM {table} WHERE visit_id=?", (visit_id,))
         connection.execute("INSERT INTO growth_assessments (visit_id,waz,haz,whz,underweight_status,stunting_status,wasting_status,generated_at) VALUES (?,?,?,?,?,?,?,?)", (visit_id,scores["waz"],scores["haz"],scores["whz"],z_status(scores["waz"],"Normal","Moderate underweight","Severe underweight"),z_status(scores["haz"],"Normal","Moderate stunting","Severe stunting"),z_status(scores["whz"],"Normal","Moderate wasting","Severe wasting"),now))
         nutrition = "sam" if item.edema else item.nutrition_result
         connection.execute("INSERT INTO nutrition_screenings (visit_id,screening_date,result,referral) VALUES (?,?,?,?)", (visit_id,item.visit_date,nutrition,item.referral))
-        if item.vitamin_a_dose: connection.execute("INSERT INTO vitamin_a (child_id,visit_id,dose_number,date_given,provider) VALUES (?,?,?,?,?)", (item.child_id,visit_id,item.vitamin_a_dose,item.visit_date,item.health_worker))
-        if item.deworming_dose: connection.execute("INSERT INTO deworming (child_id,visit_id,dose_number,date_given,provider) VALUES (?,?,?,?,?)", (item.child_id,visit_id,item.deworming_dose,item.visit_date,item.health_worker))
+        if item.vitamin_a_dose: connection.execute("INSERT INTO vitamin_a (child_id,visit_id,dose_number,date_given,provider) VALUES (?,?,?,?,?)", (item.child_id,visit_id,item.vitamin_a_dose,item.visit_date,worker))
+        if item.deworming_dose: connection.execute("INSERT INTO deworming (child_id,visit_id,dose_number,date_given,provider) VALUES (?,?,?,?,?)", (item.child_id,visit_id,item.deworming_dose,item.visit_date,worker))
         connection.execute("INSERT INTO development_screenings (child_id,visit_id,date,result,notes) VALUES (?,?,?,?,?)", (item.child_id,visit_id,item.visit_date,item.developmental_result,item.development_notes))
         connection.commit()
     return {"id": visit_id, "age_months": age, "scores": scores, "message": "Existing visit updated"}
@@ -1727,3 +1948,4 @@ def serve_frontend(path: str):
     if index.exists():
         return FileResponse(index)
     return {"message": "Clinic API is running. Build the frontend with npm run build."}
+

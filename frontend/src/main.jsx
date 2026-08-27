@@ -7,7 +7,8 @@ import './tabs.css'
 
 function Root() {
   const [authenticated, setAuthenticated] = React.useState(() => localStorage.getItem('clinical-authenticated') === 'true')
-  return authenticated ? <App /> : <Login onSuccess={() => setAuthenticated(true)} />
+  const [user, setUser] = React.useState(() => { try { return JSON.parse(localStorage.getItem('clinical-user') || 'null') } catch { return null } })
+  return authenticated ? <App user={user} /> : <Login onSuccess={(nextUser) => { setUser(nextUser); setAuthenticated(true) }} />
 }
 
 createRoot(document.getElementById('root')).render(<React.StrictMode><Root /></React.StrictMode>)

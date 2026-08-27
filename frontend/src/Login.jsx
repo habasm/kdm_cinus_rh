@@ -1,22 +1,24 @@
 import { useState } from 'react'
 
-const USERNAME = 'admin'
-const PASSWORD = '@admin365'
-
 export default function Login({ onSuccess }) {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState('')
 
-  const submit = (event) => {
+  const submit = async (event) => {
     event.preventDefault()
-    if (username.trim() === USERNAME && password === PASSWORD) {
+    try {
+      const response = await fetch('/api/login', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({username,password})})
+      const user = await response.json()
+      if (!response.ok) throw new Error(user?.detail || 'That sign-in did not match. Check your details and try again.')
       localStorage.setItem('clinical-authenticated', 'true')
-      onSuccess()
+      localStorage.setItem('clinical-user', JSON.stringify(user))
+      onSuccess(user)
       return
+    } catch (error) {
+      setError(error.message)
     }
-    setError('That sign-in did not match. Check your details and try again.')
   }
 
   return (
@@ -33,6 +35,16 @@ export default function Login({ onSuccess }) {
             <span className="login-kicker">CARE, CONNECTED</span>
             <h1>A calmer way to run<br /><em>every</em> clinical day.</h1>
             <p>One focused workspace for maternal care, child nutrition and the people behind every record.</p>
+            <div className="clinical-analog" aria-hidden="true">
+              <div className="analog-scale">
+                {Array.from({ length: 13 }, (_, index) => <span key={index} className={index % 3 === 0 ? 'major' : ''} />)}
+              </div>
+              <div className="analog-readout">
+                <i />
+                <b>MUAC</b>
+                <small>12.8 cm</small>
+              </div>
+            </div>
           </div>
           <div className="login-signal"><span className="signal-dot" /><span>Facility workspace ready</span><b>24/7</b></div>
         </div>
