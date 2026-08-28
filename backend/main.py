@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+import zipfile
 from calendar import monthrange
 from io import BytesIO
 from contextlib import closing
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from xml.sax.saxutils import escape as xml_escape
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -1580,6 +1583,13 @@ def tally_marks(value: int) -> str:
     return " ".join(["||||/" for _ in range(groups)] + (["|" * remaining] if remaining else [])) or "-"
 
 
+def table_columns(table: str) -> set[str]:
+    try:
+        return {row["name"] for row in rows(f"PRAGMA table_info({table})")}
+    except sqlite3.OperationalError:
+        return set()
+
+
 def zero_tally() -> dict[str, Any]:
     return {"gmp": {age: {s: 0 for s in ("normal", "moderate", "severe")} for age in ("0-5", "6-23")}, "screen": {age: {s: 0 for s in ("normal", "mam", "sam")} for age in ("0-5", "6-23", "24-59")}, "vitamin": {"6-11": {"one": 0, "two": 0}, "12-59": {"one": 0, "two": 0}}, "deworming": {"one": 0, "two": 0}, "development": {age: {s: 0 for s in ("cdd", "sdd", "ndd")} for age in ("0-23", "24-59")}}
 
@@ -1617,6 +1627,422 @@ def build_cinus_tally(month: str, region: str = "Amhara", woreda: str = "Bahir D
         development_age = "0-23" if age <= 23 else "24-59"
         if item["developmental_status"] in tally["development"][development_age]: tally["development"][development_age][item["developmental_status"]] += 1
     return {"month": month, "year": month[:4], "region": region, "woreda": woreda, "facility": facility, "begin_date": begin_date, "end_date": end_date, "records": len(services), "tally": tally}
+
+
+def birth_weight_summary(begin_date: str, end_date: str) -> dict[str, int]:
+    total = low = 0
+    columns = table_columns("rh_cards")
+    if not columns:
+        return {"low_birth_weight": low, "live_births_weighed": total}
+    source_column = "sections" if "sections" in columns else "payload" if "payload" in columns else ""
+    if not source_column:
+        return {"low_birth_weight": low, "live_births_weighed": total}
+    for row in rows(f"SELECT {source_column} AS source FROM rh_cards"):
+        try:
+            source = json.loads(row["source"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        sections = source.get("sections", source) if isinstance(source, dict) else {}
+        delivery = sections.get("delivery") or {}
+        notification = sections.get("birth_notification") or {}
+        birth_date = notification.get("birth_date") or delivery.get("delivery_date") or delivery.get("Delivery date") or ""
+        if not birth_date or not (begin_date <= birth_date <= end_date):
+            continue
+        children = notification.get("children") if isinstance(notification.get("children"), list) else []
+        if not children:
+            children = [{"birth_weight": notification.get("birth_weight") or delivery.get("birth_weight") or delivery.get("Birth weight (g)"), "outcome": notification.get("outcome") or "Live birth"}]
+        for child in children:
+            outcome = str(child.get("outcome") or "Live birth").lower()
+            if outcome and "live" not in outcome:
+                continue
+            try:
+                weight = float(child.get("birth_weight") or 0)
+            except (TypeError, ValueError):
+                weight = 0
+            if weight <= 0:
+                continue
+            total += 1
+            if weight < 2500:
+                low += 1
+    return {"low_birth_weight": low, "live_births_weighed": total}
+
+
+def rh_payloads() -> list[dict[str, Any]]:
+    columns = table_columns("rh_cards")
+    if "payload" not in columns:
+        return []
+    cards: list[dict[str, Any]] = []
+    for row in rows("SELECT payload FROM rh_cards"):
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            payload.setdefault("sections", {})
+            cards.append(payload)
+    return cards
+
+
+def parse_weeks(value: Any) -> float:
+    text = str(value or "").lower().replace("weeks", "").replace("week", "").strip()
+    try:
+        return float(text.split()[0])
+    except (ValueError, IndexError):
+        return 0
+
+
+def has_any(value: Any, terms: tuple[str, ...]) -> bool:
+    if isinstance(value, list):
+        text = " ".join(map(str, value)).lower()
+    else:
+        text = str(value or "").lower()
+    return any(term in text for term in terms)
+
+
+def maternal_report_rows(begin_date: str, end_date: str) -> list[dict[str, Any]]:
+    cards = rh_payloads()
+    counters = {key: 0 for key in (
+        "anc1_le12", "anc1_13_16", "anc1_gt16", "anc1_10_14", "anc1_15_19", "anc1_20",
+        "anc4_lt30", "anc4_ge30", "anc4_10_14", "anc4_15_19", "anc4_20", "anc8",
+        "syph_tested", "syph_reactive", "syph_nonreactive", "syph_treated", "hepa_tested",
+        "hepa_reactive", "hepa_nonreactive", "hbv_prophylaxis", "sba", "pph_home", "pph_facility",
+        "uter_oxy", "uter_miso", "uter_ergo", "uter_other", "still_births", "live_births",
+        "community_birth", "community_death", "institutional_birth", "institutional_death",
+        "pnc_0_24", "pnc_24h", "pnc_25_48", "pnc_49_72", "pnc_73_7", "csection",
+        "hiv_pregnancy", "hiv_labor", "hiv_postpartum", "hiv_known_positive", "hiv_new_positive",
+        "pregnant_dewormed", "ifa_90_10_14", "ifa_90_15_19", "ifa_90_20", "preg_muac_lt23", "preg_muac_ge23", "lact_muac_lt23", "lact_muac_ge23",
+    )}
+    for card in cards:
+        age = int(card.get("age") or 0)
+        sections = card.get("sections") or {}
+        anc = sections.get("anc") or {}
+        delivery = sections.get("delivery") or {}
+        postpartum = sections.get("postpartum") or {}
+        notification = sections.get("birth_notification") or {}
+        contact_dates = {}
+        for i in range(1, 9):
+            d = anc.get(f"{i}Date of contact") or anc.get(f"{i}Date") or ""
+            if d and begin_date <= d <= end_date:
+                contact_dates[i] = d
+        if 1 in contact_dates:
+            ga = parse_weeks(anc.get("1Gestational age"))
+            if ga and ga <= 12: counters["anc1_le12"] += 1
+            elif ga and ga <= 16: counters["anc1_13_16"] += 1
+            else: counters["anc1_gt16"] += 1
+            if age <= 14: counters["anc1_10_14"] += 1
+            elif age <= 19: counters["anc1_15_19"] += 1
+            else: counters["anc1_20"] += 1
+        recorded_contacts = [i for i in range(1, 9) if anc.get(f"{i}Date of contact") or anc.get(f"{i}Date")]
+        if len(recorded_contacts) >= 4 and any(i in contact_dates for i in recorded_contacts):
+            last_ga = max(parse_weeks(anc.get(f"{i}Gestational age")) for i in recorded_contacts)
+            if last_ga and last_ga < 30: counters["anc4_lt30"] += 1
+            else: counters["anc4_ge30"] += 1
+            if age <= 14: counters["anc4_10_14"] += 1
+            elif age <= 19: counters["anc4_15_19"] += 1
+            else: counters["anc4_20"] += 1
+        if len(recorded_contacts) >= 8 and any(i in contact_dates for i in recorded_contacts):
+            counters["anc8"] += 1
+        for i in range(1, 9):
+            if i not in contact_dates:
+                continue
+            syph = anc.get(f"{i}RPR / VDRL", "")
+            hepa = anc.get(f"{i}HBsAg", "")
+            if str(syph).strip() and "not done" not in str(syph).lower():
+                counters["syph_tested"] += 1
+                counters["syph_reactive" if has_any(syph, ("reactive", "positive")) and not has_any(syph, ("non", "negative")) else "syph_nonreactive"] += 1
+            if str(anc.get(f"{i}Syphilis treatment", "")).strip() and "not applicable" not in str(anc.get(f"{i}Syphilis treatment", "")).lower():
+                counters["syph_treated"] += 1
+            if str(hepa).strip() and "not done" not in str(hepa).lower():
+                counters["hepa_tested"] += 1
+                counters["hepa_reactive" if has_any(hepa, ("reactive", "positive")) and not has_any(hepa, ("non", "negative")) else "hepa_nonreactive"] += 1
+            if str(anc.get(f"{i}HBV prophylaxis", "")).strip() and "not applicable" not in str(anc.get(f"{i}HBV prophylaxis", "")).lower():
+                counters["hbv_prophylaxis"] += 1
+            if str(anc.get(f"{i}HIV PITC - pregnant client", "")).strip() and "not done" not in str(anc.get(f"{i}HIV PITC - pregnant client", "")).lower():
+                counters["hiv_pregnancy"] += 1
+            if str(anc.get(f"{i}Preventive anti-helminthic treatment", "")).strip() and "not applicable" not in str(anc.get(f"{i}Preventive anti-helminthic treatment", "")).lower():
+                counters["pregnant_dewormed"] += 1
+            if has_any(anc.get(f"{i}IFA 90+ received", ""), ("yes", "received", "given")):
+                if age <= 14: counters["ifa_90_10_14"] += 1
+                elif age <= 19: counters["ifa_90_15_19"] += 1
+                else: counters["ifa_90_20"] += 1
+            try:
+                muac = float(anc.get(f"{i}Maternal MUAC (cm)") or 0)
+            except (TypeError, ValueError):
+                muac = 0
+            if muac:
+                counters["preg_muac_lt23" if muac < 23 else "preg_muac_ge23"] += 1
+        delivery_date = notification.get("birth_date") or delivery.get("delivery_date") or delivery.get("Delivery date") or ""
+        in_delivery_period = bool(delivery_date and begin_date <= delivery_date <= end_date)
+        if in_delivery_period:
+            if str(delivery.get("delivered_by") or delivery.get("Delivered by") or notification.get("attendant") or "").strip():
+                counters["sba"] += 1
+            if has_any(delivery.get("Mode of delivery") or delivery.get("Mode of delivery", ""), ("c/section", "caesarean", "cesarean")):
+                counters["csection"] += 1
+            if has_any(delivery.get("pph_occurred") or delivery.get("Complications") or "", ("yes", "pph")):
+                counters["pph_home" if has_any(delivery.get("place_of_delivery") or "", ("home", "community")) else "pph_facility"] += 1
+            uter = delivery.get("AMTSL uterotonic") or ""
+            if has_any(uter, ("oxytocin",)): counters["uter_oxy"] += 1
+            if has_any(uter, ("misoprostol", "mesoprostol")): counters["uter_miso"] += 1
+            if has_any(uter, ("ergometrine", "ergometrin")): counters["uter_ergo"] += 1
+            if has_any(uter, ("other",)): counters["uter_other"] += 1
+            children = notification.get("children") if isinstance(notification.get("children"), list) else []
+            if not children:
+                children = [{"outcome": notification.get("outcome") or "Live birth"}]
+            for child in children:
+                outcome = str(child.get("outcome") or "Live birth").lower()
+                if "still" in outcome: counters["still_births"] += 1
+                else: counters["live_births"] += 1
+            birth_notification_type = notification.get("birth_notification_type") or delivery.get("birth_notification_type") or ("Institutional" if notification else "")
+            death_notification_type = notification.get("death_notification_type") or delivery.get("death_notification_type") or ""
+            if has_any(birth_notification_type, ("community",)): counters["community_birth"] += 1
+            elif notification or has_any(birth_notification_type, ("institution", "facility")): counters["institutional_birth"] += 1
+            if has_any(death_notification_type, ("community",)): counters["community_death"] += 1
+            elif has_any(death_notification_type, ("institution", "facility")): counters["institutional_death"] += 1
+            if str(delivery.get("arv_mother") or "").strip() and "not applicable" not in str(delivery.get("arv_mother") or "").lower():
+                counters["hiv_labor"] += 1
+            if has_any(delivery.get("known_hiv_positive") or "", ("yes", "positive")): counters["hiv_known_positive"] += 1
+            if has_any(delivery.get("new_hiv_positive") or delivery.get("HIV test result") or "", ("yes", "positive")) and not has_any(delivery.get("known_hiv_positive") or "", ("yes",)):
+                counters["hiv_new_positive"] += 1
+        for key, counter in (("24 hoursDate","pnc_0_24"), ("25-48 hoursDate","pnc_25_48"), ("49-72 hoursDate","pnc_49_72"), ("73 hours-7 daysDate","pnc_73_7")):
+            d = postpartum.get(key) or ""
+            if d and begin_date <= d <= end_date:
+                counters[counter] += 1
+                try:
+                    muac = float(postpartum.get(key.replace("Date", "Maternal MUAC (cm)")) or 0)
+                except (TypeError, ValueError):
+                    muac = 0
+                if muac:
+                    counters["lact_muac_lt23" if muac < 23 else "lact_muac_ge23"] += 1
+        if any(begin_date <= str(v) <= end_date for k, v in postpartum.items() if k.endswith("Date")):
+            if any("hiv" in k.lower() and str(v).strip() for k, v in postpartum.items()):
+                counters["hiv_postpartum"] += 1
+    values = {
+        "MAT_ANC1_GA.1": counters["anc1_le12"] + counters["anc1_13_16"] + counters["anc1_gt16"],
+        "MAT_ANC1_GA.1.1": counters["anc1_le12"], "MAT_ANC1_GA.1.2": counters["anc1_13_16"], "MAT_ANC1_GA.1.3": counters["anc1_gt16"],
+        "MAT_ANC1_MA.1": counters["anc1_10_14"] + counters["anc1_15_19"] + counters["anc1_20"],
+        "MAT_ANC1_MA.1.1": counters["anc1_10_14"], "MAT_ANC1_MA.1.2": counters["anc1_15_19"], "MAT_ANC1_MA.1.3": counters["anc1_20"],
+        "MAT_ANC4+_GA.1": counters["anc4_lt30"] + counters["anc4_ge30"], "MAT_ANC4+_GA.1.1": counters["anc4_lt30"], "MAT_ANC4+_GA.1.2": counters["anc4_ge30"],
+        "MAT_ANC4+_MA.1": counters["anc4_10_14"] + counters["anc4_15_19"] + counters["anc4_20"], "MAT_ANC4+_MA.1.1": counters["anc4_10_14"], "MAT_ANC4+_MA.1.2": counters["anc4_15_19"], "MAT_ANC4+_MA.1.3": counters["anc4_20"],
+        "MAT_ANC8+": counters["anc8"], "MAT_SYPH.1": counters["syph_tested"], "MAT_SYPH_Rct.1": counters["syph_reactive"], "MAT_SYPH_NRct.1": counters["syph_nonreactive"], "MAT_SYPH.RX.1": counters["syph_treated"],
+        "MAT_Hepa": counters["hepa_tested"], "MAT_Hepa_Rct.1": counters["hepa_reactive"], "MAT_Hepa_NRct.1": counters["hepa_nonreactive"], "MAT_Prp": counters["hbv_prophylaxis"],
+        "MAT_SBA.1": counters["sba"], "MAT_PPH.1": counters["pph_home"] + counters["pph_facility"], "MAT_PPH.Hom.1": counters["pph_home"], "MAT_PPH.facil.1": counters["pph_facility"],
+        "MAT_UTER.1": counters["uter_oxy"] + counters["uter_miso"] + counters["uter_ergo"] + counters["uter_other"], "MAT_UTR.type.1.1": counters["uter_oxy"], "MAT_UTR.type.1.2": counters["uter_miso"], "MAT_UTR.type.1.3": counters["uter_ergo"], "MAT_UTR.type.1.4": counters["uter_other"],
+        "MAT_SBR.SB": counters["still_births"], "MAT_SBR.LB": counters["live_births"], "MAT_B&D_CBN_1": counters["community_birth"], "MAT_B&D_CDN_2": counters["community_death"], "MAT_B&D_IBN.1": counters["institutional_birth"], "MAT_B&D_IDN.2": counters["institutional_death"],
+        "MAT_EPNC.1": counters["pnc_0_24"] + counters["pnc_24h"] + counters["pnc_25_48"] + counters["pnc_49_72"] + counters["pnc_73_7"], "MAT_EPNC.1.0": counters["pnc_0_24"], "MAT_EPNC.1.1": counters["pnc_24h"], "MAT_EPNC.1.2": counters["pnc_25_48"], "MAT_EPNC.1.3": counters["pnc_49_72"], "MAT_EPNC.1.4": counters["pnc_73_7"],
+        "MAT_CS.1": counters["csection"], "MTCT_TST.1": counters["hiv_pregnancy"], "MTCT_TST.2": counters["hiv_labor"], "MTCT_TST.3": counters["hiv_postpartum"], "MTCT_Test.4": counters["hiv_known_positive"], "MTCT_NWpos": counters["hiv_new_positive"],
+        "NUT_DeW.2": counters["pregnant_dewormed"], "NUT_IFA.1": counters["ifa_90_10_14"] + counters["ifa_90_15_19"] + counters["ifa_90_20"], "NUT_IFA.1.1": counters["ifa_90_10_14"], "NUT_IFA.1.2": counters["ifa_90_15_19"], "NUT_IFA.1.3": counters["ifa_90_20"],
+        "NUT_PreSMN.1": counters["preg_muac_lt23"] + counters["preg_muac_ge23"] + counters["lact_muac_lt23"] + counters["lact_muac_ge23"], "NUT_PreSMN.1.1": counters["preg_muac_lt23"] + counters["lact_muac_lt23"], "NUT_PreSMN.1.2": counters["preg_muac_ge23"] + counters["lact_muac_ge23"],
+        "NUT_PreSMN.2": counters["preg_muac_lt23"] + counters["preg_muac_ge23"] + counters["lact_muac_lt23"] + counters["lact_muac_ge23"], "NUT_PreSMN.2.1": counters["preg_muac_lt23"] + counters["preg_muac_ge23"], "NUT_PreSMN.2.2": counters["lact_muac_lt23"] + counters["lact_muac_ge23"],
+    }
+    return [{"hmis_code": k, "number": v} for k, v in values.items()]
+
+
+def cinus_hmis_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
+    t = report["tally"]
+    bw = birth_weight_summary(report["begin_date"], report["end_date"])
+    maternal_values = {r["hmis_code"]: r["number"] for r in maternal_report_rows(report["begin_date"], report["end_date"])}
+    gmp_0_5 = sum(t["gmp"]["0-5"].values()); gmp_6_23 = sum(t["gmp"]["6-23"].values())
+    screen_0_5 = sum(t["screen"]["0-5"].values()); screen_6_23 = sum(t["screen"]["6-23"].values()); screen_24_59 = sum(t["screen"]["24-59"].values())
+    rows_out = [
+        ("D1", "Enhance provision of equitable and quality comprehensive health services", "", "Heading", ""),
+        ("NUT", "Nutrition", "", "Heading", ""),
+        ("NUT_LBW", "Percentage of low birth weight newborns", "", "Summary", "Calculated from delivery / birth notification when birth weight is recorded."),
+        ("NUT_LBW.1", "Number of live-born babies with birth weight less than 2,500 gm", bw["low_birth_weight"], "Ready", "RH delivery and birth notification source."),
+        ("NUT_LBW.2", "Total number of live births weighed", bw["live_births_weighed"], "Ready", "RH delivery and birth notification source."),
+        ("NUT_GMP", "Promotion of GMP participation among children under 2 years", "", "Summary", "Calculated from CINUS follow-up visits."),
+        ("NTR_GMP.1", "Number of children less than 2 years weighed during GMP session", gmp_0_5 + gmp_6_23, "Ready", "CINUS growth visit records."),
+        ("NUT_GMP.1.1", "Age: 0 - 5 months", gmp_0_5, "Ready", "CINUS growth visit records."),
+        ("NUT_GMP.1.2", "Age: 6 - 23 months", gmp_6_23, "Ready", "CINUS growth visit records."),
+        ("NUT_GMP.MM.1", "Weights recorded with moderate underweight, by age", t["gmp"]["0-5"]["moderate"] + t["gmp"]["6-23"]["moderate"], "Ready", "WAZ between -2 and -3."),
+        ("NUT_GMP_MM.1.1", "Age: 0 - 5 months", t["gmp"]["0-5"]["moderate"], "Ready", "CINUS growth assessment."),
+        ("NUT_GMP_MM.1.2", "Age: 6 - 23 months", t["gmp"]["6-23"]["moderate"], "Ready", "CINUS growth assessment."),
+        ("NUT_GMP_SM", "Weights recorded with severe underweight, by age", t["gmp"]["0-5"]["severe"] + t["gmp"]["6-23"]["severe"], "Ready", "WAZ below -3."),
+        ("NUT_GMP_SM.1.1", "Age: 0 - 5 months", t["gmp"]["0-5"]["severe"], "Ready", "CINUS growth assessment."),
+        ("NUT_GMP_SM.1.2", "Age: 6 - 23 months", t["gmp"]["6-23"]["severe"], "Ready", "CINUS growth assessment."),
+        ("NUT_VITA", "Children aged 6-59 months who received vitamin A supplementation", "", "Summary", "Calculated from CINUS follow-up service records."),
+        ("NUT_VITA.1", "Vitamin A by age", sum(sum(x.values()) for x in t["vitamin"].values()), "Ready", "CINUS vitamin A records."),
+        ("NUT_VITA.1.1", "Age: 6 - 11 months", sum(t["vitamin"]["6-11"].values()), "Ready", "CINUS vitamin A records."),
+        ("NUT_VITA.1.2", "Age: 12 - 59 months", sum(t["vitamin"]["12-59"].values()), "Ready", "CINUS vitamin A records."),
+        ("NUT_VITA.2", "Vitamin A supplementation disaggregated by dose", sum(sum(x.values()) for x in t["vitamin"].values()), "Ready", "CINUS vitamin A records."),
+        ("NUT_VITA.2.1", "First dose", t["vitamin"]["6-11"]["one"] + t["vitamin"]["12-59"]["one"], "Ready", "CINUS vitamin A records."),
+        ("NUT_VITA.2.2", "Second dose", t["vitamin"]["6-11"]["two"] + t["vitamin"]["12-59"]["two"], "Ready", "CINUS vitamin A records."),
+        ("NUT_DeW", "Children 24-59 months who received deworming", "", "Summary", "Calculated from CINUS follow-up service records."),
+        ("NUT_DeW.1", "Total children aged 24-59 months dewormed", t["deworming"]["one"] + t["deworming"]["two"], "Ready", "CINUS deworming records."),
+        ("NUT_DeW.1.1", "First dose", t["deworming"]["one"], "Ready", "CINUS deworming records."),
+        ("NUT_DeW.1.2", "Second dose", t["deworming"]["two"], "Ready", "CINUS deworming records."),
+        ("NUT_DeW.2", "Number of pregnant women dewormed", maternal_values.get("NUT_DeW.2", 0), "Ready", "Calculated from ANC anti-helminthic treatment records."),
+        ("NUT_IFA", "Proportion of pregnant women receiving IFA supplements at least 90 plus", "", "Summary", "Uses structured ANC IFA 90+ field."),
+        ("NUT_IFA.1", "Total pregnant women received IFA at least 90 plus", maternal_values.get("NUT_IFA.1", 0), "Ready", "Calculated from ANC IFA 90+ field."),
+        ("NUT_IFA.1.1", "10-14 years", maternal_values.get("NUT_IFA.1.1", 0), "Ready", "Maternal age disaggregation."),
+        ("NUT_IFA.1.2", "15-19 years", maternal_values.get("NUT_IFA.1.2", 0), "Ready", "Maternal age disaggregation."),
+        ("NUT_IFA.1.3", ">= 20 years", maternal_values.get("NUT_IFA.1.3", 0), "Ready", "Maternal age disaggregation."),
+        ("NUT_PreSMN", "Pregnant and lactating women screened for acute malnutrition", "", "Summary", "Uses ANC and postpartum maternal MUAC fields."),
+        ("NUT_PreSMN.1", "PLW screened for acute malnutrition by MUAC status", maternal_values.get("NUT_PreSMN.1", 0), "Ready", "Calculated from ANC/postpartum MUAC records."),
+        ("NUT_PreSMN.1.1", "MUAC < 23 cm", maternal_values.get("NUT_PreSMN.1.1", 0), "Ready", "Calculated from ANC/postpartum MUAC records."),
+        ("NUT_PreSMN.1.2", "MUAC >= 23 cm", maternal_values.get("NUT_PreSMN.1.2", 0), "Ready", "Calculated from ANC/postpartum MUAC records."),
+        ("NUT_PreSMN.2", "PLW screened for acute malnutrition by maternal status", maternal_values.get("NUT_PreSMN.2", 0), "Ready", "Pregnant from ANC, lactating from postpartum."),
+        ("NUT_PreSMN.2.1", "Pregnant", maternal_values.get("NUT_PreSMN.2.1", 0), "Ready", "ANC source."),
+        ("NUT_PreSMN.2.2", "Lactating", maternal_values.get("NUT_PreSMN.2.2", 0), "Ready", "Postpartum source."),
+        ("NUT_U5SMN", "Children aged <5 years screened for acute malnutrition", "", "Summary", "Calculated from CINUS nutrition screening."),
+        ("NUT_U5SMN.1", "Total children <5 years screened for acute malnutrition", screen_0_5 + screen_6_23 + screen_24_59, "Ready", "CINUS nutrition screening."),
+        ("NUT_U5SMN.1.1", "Age: 0 - 5 months", screen_0_5, "Ready", "CINUS nutrition screening."),
+        ("NUT_U5SMN.1.2", "Age: 6 - 23 months", screen_6_23, "Ready", "CINUS nutrition screening."),
+        ("NUT_U5SMN.1.3", "Age: 24 - 59 months", screen_24_59, "Ready", "CINUS nutrition screening."),
+        ("NUT_U5SMN.MAM.1", "Children <5 screened and having moderate acute malnutrition", t["screen"]["0-5"]["mam"] + t["screen"]["6-23"]["mam"] + t["screen"]["24-59"]["mam"], "Ready", "CINUS nutrition screening."),
+        ("NUT_U5SMN.MAM.1.1", "Age: 0 - 5 months", t["screen"]["0-5"]["mam"], "Ready", "CINUS nutrition screening."),
+        ("NUT_U5SMN.MAM.1.2", "Age: 6 - 23 months", t["screen"]["6-23"]["mam"], "Ready", "CINUS nutrition screening."),
+        ("NUT_U5SMN.MAM.1.3", "Age: 24 - 59 months", t["screen"]["24-59"]["mam"], "Ready", "CINUS nutrition screening."),
+        ("NUT_U5SMN.SAM.1", "Children <5 screened and having severe acute malnutrition", t["screen"]["0-5"]["sam"] + t["screen"]["6-23"]["sam"] + t["screen"]["24-59"]["sam"], "Ready", "CINUS nutrition screening."),
+        ("NUT_U5SMN.SAM.1.1", "Age: 0 - 5 months", t["screen"]["0-5"]["sam"], "Ready", "CINUS nutrition screening."),
+        ("NUT_U5SMN.SAM.1.2", "Age: 6 - 23 months", t["screen"]["6-23"]["sam"], "Ready", "CINUS nutrition screening."),
+        ("NUT_U5SMN.SAM.1.3", "Age: 24 - 59 months", t["screen"]["24-59"]["sam"], "Ready", "CINUS nutrition screening."),
+    ]
+    return [{"hmis_code": code, "activity": activity, "number": number, "status": status, "consideration": note} for code, activity, number, status, note in rows_out]
+
+
+def excel_col(index: int) -> str:
+    name = ""
+    while index:
+        index, rem = divmod(index - 1, 26)
+        name = chr(65 + rem) + name
+    return name
+
+
+def excel_sheet_xml(headers: list[str], data: list[list[Any]]) -> str:
+    rows_xml = []
+    for r, values in enumerate([headers, *data], 1):
+        cells = []
+        for c, value in enumerate(values, 1):
+            ref = f"{excel_col(c)}{r}"
+            if isinstance(value, (int, float)):
+                cells.append(f'<c r="{ref}"><v>{value}</v></c>')
+            else:
+                cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{xml_escape(str(value or ""))}</t></is></c>')
+        rows_xml.append(f'<row r="{r}">{"".join(cells)}</row>')
+    return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><cols><col min="1" max="1" width="18" customWidth="1"/><col min="2" max="2" width="72" customWidth="1"/><col min="3" max="3" width="14" customWidth="1"/><col min="4" max="4" width="22" customWidth="1"/><col min="5" max="5" width="58" customWidth="1"/></cols><sheetData>' + "".join(rows_xml) + "</sheetData></worksheet>"
+
+
+def cell_text(value: Any) -> str:
+    if isinstance(value, tuple) and value[0] == "formula":
+        return f'<f>{xml_escape(value[1])}</f>'
+    if value == "":
+        return ""
+    return f'<v>{int(value) if isinstance(value, int) or isinstance(value, float) and value.is_integer() else value}</v>'
+
+
+def update_template_number_cells(sheet_xml: str, values_by_row: dict[int, Any]) -> str:
+    for row_number, value in values_by_row.items():
+        content = cell_text(value)
+        row_pattern = re.compile(rf'(<row\b[^>]*\br="{row_number}"[^>]*>)(.*?)(</row>)', re.S)
+        match = row_pattern.search(sheet_xml)
+        if not match:
+            continue
+        before, body, after = match.groups()
+        cell_pattern = re.compile(rf'<c\b[^>]*\br="C{row_number}"[^>]*/>|<c\b[^>]*\br="C{row_number}"[^>]*>.*?</c>', re.S)
+        cell_match = cell_pattern.search(body)
+        style = "17"
+        if cell_match:
+            style_match = re.search(r'\bs="([^"]+)"', cell_match.group(0))
+            if style_match:
+                style = style_match.group(1)
+            body = cell_pattern.sub("", body)
+        new_cell = f'<c r="C{row_number}" s="{style}">{content}</c>' if content else f'<c r="C{row_number}" s="{style}"/>'
+        insert_at = len(body)
+        next_cell = re.search(r'<c\b[^>]*\br="[D-Z]+', body)
+        if next_cell:
+            insert_at = next_cell.start()
+        replacement_row = before + body[:insert_at] + new_cell + body[insert_at:] + after
+        sheet_xml = sheet_xml[:match.start()] + replacement_row + sheet_xml[match.end():]
+    return sheet_xml
+
+
+def create_cinus_excel(report: dict[str, Any]) -> BytesIO:
+    out = BytesIO()
+    row_numbers = {
+        "NUT_LBW.1": 5, "NUT_LBW.2": 6, "NTR_GMP.1": 8, "NUT_GMP.1.1": 9, "NUT_GMP.1.2": 10,
+        "NUT_GMP.MM.1": 11, "NUT_GMP_MM.1.1": 12, "NUT_GMP_MM.1.2": 13, "NUT_GMP_SM": 14,
+        "NUT_GMP_SM.1.1": 15, "NUT_GMP_SM.1.2": 16, "NUT_VITA.1": 18, "NUT_VITA.1.1": 19,
+        "NUT_VITA.1.2": 20, "NUT_VITA.2": 21, "NUT_VITA.2.1": 22, "NUT_VITA.2.2": 23,
+        "NUT_DeW.1": 25, "NUT_DeW.1.1": 26, "NUT_DeW.1.2": 27, "NUT_DeW.2": 28,
+        "NUT_IFA.1": 30, "NUT_IFA.1.1": 31, "NUT_IFA.1.2": 32, "NUT_IFA.1.3": 33,
+        "NUT_PreSMN.1": 35, "NUT_PreSMN.1.1": 36, "NUT_PreSMN.1.2": 37, "NUT_PreSMN.2": 38,
+        "NUT_PreSMN.2.1": 39, "NUT_PreSMN.2.2": 40, "NUT_U5SMN.1": 42, "NUT_U5SMN.1.1": 43,
+        "NUT_U5SMN.1.2": 44, "NUT_U5SMN.1.3": 45, "NUT_U5SMN.MAM.1": 46,
+        "NUT_U5SMN.MAM.1.1": 47, "NUT_U5SMN.MAM.1.2": 48, "NUT_U5SMN.MAM.1.3": 49,
+        "NUT_U5SMN.SAM.1": 50, "NUT_U5SMN.SAM.1.1": 51, "NUT_U5SMN.SAM.1.2": 52,
+        "NUT_U5SMN.SAM.1.3": 53,
+    }
+    values = {row_numbers[r["hmis_code"]]: r["number"] for r in cinus_hmis_rows(report) if r["hmis_code"] in row_numbers and r["number"] != ""}
+    template = ROOT / "report_forms.xlsx"
+    if not template.exists():
+        template = Path(r"C:\Users\hman\Downloads\report_forms.xlsx")
+    if template.exists():
+        with zipfile.ZipFile(template, "r") as source, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as target:
+            for item in source.infolist():
+                content = source.read(item.filename)
+                if item.filename == "xl/worksheets/sheet2.xml":
+                    content = update_template_number_cells(content.decode("utf-8"), values).encode("utf-8")
+                target.writestr(item, content)
+    else:
+        report_rows = cinus_hmis_rows(report)
+        data = [[r["hmis_code"], r["activity"], r["number"], r["status"], r["consideration"]] for r in report_rows]
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>')
+            zf.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+            zf.writestr("xl/workbook.xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="CINUS_Report_form" sheetId="1" r:id="rId1"/></sheets></workbook>')
+            zf.writestr("xl/_rels/workbook.xml.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>')
+            zf.writestr("xl/worksheets/sheet1.xml", excel_sheet_xml(["HMIS code", "Activity", "Number", "Status", "Consideration"], data))
+    out.seek(0)
+    return out
+
+
+def create_maternal_excel(begin_date: str, end_date: str) -> BytesIO:
+    out = BytesIO()
+    row_numbers = {
+        "MAT_ANC1_GA.1": 2, "MAT_ANC1_GA.1.1": 3, "MAT_ANC1_GA.1.2": 4, "MAT_ANC1_GA.1.3": 5,
+        "MAT_ANC1_MA.1": 6, "MAT_ANC1_MA.1.1": 7, "MAT_ANC1_MA.1.2": 8, "MAT_ANC1_MA.1.3": 9,
+        "MAT_ANC4+_GA.1": 11, "MAT_ANC4+_GA.1.1": 12, "MAT_ANC4+_GA.1.2": 13,
+        "MAT_ANC4+_MA.1": 14, "MAT_ANC4+_MA.1.1": 15, "MAT_ANC4+_MA.1.2": 16, "MAT_ANC4+_MA.1.3": 17,
+        "MAT_ANC8+": 19, "MAT_SYPH.1": 21, "MAT_SYPH_Rct.1": 22, "MAT_SYPH_NRct.1": 23, "MAT_SYPH.RX.1": 24,
+        "MAT_Hepa": 25, "MAT_Hepa_Rct.1": 26, "MAT_Hepa_NRct.1": 27, "MAT_Prp": 28, "MAT_SBA.1": 30,
+        "MAT_PPH.1": 32, "MAT_PPH.Hom.1": 33, "MAT_PPH.facil.1": 34, "MAT_UTER.1": 36,
+        "MAT_UTR.type.1.1": 37, "MAT_UTR.type.1.2": 38, "MAT_UTR.type.1.3": 39, "MAT_UTR.type.1.4": 40,
+        "MAT_SBR.SB": 42, "MAT_SBR.LB": 43, "MAT_B&D_CBN_1": 45, "MAT_B&D_CDN_2": 46, "MAT_B&D_IBN.1": 47, "MAT_B&D_IDN.2": 48,
+        "MAT_EPNC.1": 50, "MAT_EPNC.1.0": 51, "MAT_EPNC.1.1": 52, "MAT_EPNC.1.2": 53, "MAT_EPNC.1.3": 54, "MAT_EPNC.1.4": 55,
+        "MAT_CS.1": 57, "MTCT_TST.1": 60, "MTCT_TST.2": 61, "MTCT_TST.3": 62, "MTCT_Test.4": 63, "MTCT_NWpos": 64,
+    }
+    values = {row_numbers[r["hmis_code"]]: r["number"] for r in maternal_report_rows(begin_date, end_date) if r["hmis_code"] in row_numbers}
+    values.update({
+        2: ("formula", "SUM(C3:C5)"),
+        6: ("formula", "SUM(C7:C9)"),
+        11: ("formula", "SUM(C12:C13)"),
+        14: ("formula", "SUM(C15:C17)"),
+        21: ("formula", "SUM(C22:C23)"),
+        25: ("formula", "SUM(C26:C27)"),
+        32: ("formula", "SUM(C33:C34)"),
+        36: ("formula", "SUM(C37:C40)"),
+        50: ("formula", "SUM(C51:C55)"),
+    })
+    template = ROOT / "report_forms.xlsx"
+    if not template.exists():
+        template = Path(r"C:\Users\hman\Downloads\report_forms.xlsx")
+    if template.exists():
+        with zipfile.ZipFile(template, "r") as source, zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as target:
+            for item in source.infolist():
+                content = source.read(item.filename)
+                if item.filename == "xl/worksheets/sheet1.xml":
+                    content = update_template_number_cells(content.decode("utf-8"), values).encode("utf-8")
+                target.writestr(item, content)
+    else:
+        data = [[r["hmis_code"], "", r["number"]] for r in maternal_report_rows(begin_date, end_date)]
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>')
+            zf.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+            zf.writestr("xl/workbook.xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Mathernal_report_form" sheetId="1" r:id="rId1"/></sheets></workbook>')
+            zf.writestr("xl/_rels/workbook.xml.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>')
+            zf.writestr("xl/worksheets/sheet1.xml", excel_sheet_xml(["HMIS code", "Activity", "Number"], data))
+    out.seek(0)
+    return out
 
 
 @app.get("/api/child-services")
@@ -1814,7 +2240,9 @@ def update_visit(visit_id: int, item: VisitInput, request: Request) -> dict[str,
 
 @app.get("/api/cinus-tally")
 def cinus_tally(month: str, region: str = "Amhara", woreda: str = "Bahir Dar", facility: str = "Kidanemihiret", begin_date: str | None = None, end_date: str | None = None) -> dict[str, Any]:
-    return build_cinus_tally(month, region, woreda, facility, begin_date, end_date)
+    report = build_cinus_tally(month, region, woreda, facility, begin_date, end_date)
+    report["hmis_rows"] = cinus_hmis_rows(report)
+    return report
 
 
 def cell(value: Any, bold: bool = False) -> Paragraph:
@@ -1931,6 +2359,53 @@ def create_cinus_pdf(report: dict[str, Any]) -> BytesIO:
 def cinus_tally_pdf(month: str, region: str = "Amhara", woreda: str = "Bahir Dar", facility: str = "Kidanemihiret", begin_date: str | None = None, end_date: str | None = None):
     report = build_cinus_tally(month, region, woreda, facility, begin_date, end_date)
     return Response(content=create_cinus_pdf(report).getvalue(), media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="CINUS-tally-{month}.pdf"'})
+
+
+@app.get("/api/cinus-tally/excel")
+def cinus_tally_excel(month: str, region: str = "Amhara", woreda: str = "Bahir Dar", facility: str = "Kidanemihiret", begin_date: str | None = None, end_date: str | None = None):
+    report = build_cinus_tally(month, region, woreda, facility, begin_date, end_date)
+    return Response(content=create_cinus_excel(report).getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="CINUS-HMIS-report-{month}.xlsx"'})
+
+
+@app.get("/api/rh-report/excel")
+def rh_report_excel(begin_date: str | None = None, end_date: str | None = None):
+    today = date.today()
+    begin_date = begin_date or f"{today.year}-{today.month:02d}-01"
+    end_date = end_date or f"{today.year}-{today.month:02d}-{monthrange(today.year, today.month)[1]:02d}"
+    return Response(content=create_maternal_excel(begin_date, end_date).getvalue(), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={"Content-Disposition": f'attachment; filename="Maternal-RH-HMIS-report-{begin_date}-to-{end_date}.xlsx"'})
+
+
+@app.get("/api/rh-report")
+def rh_report(begin_date: str | None = None, end_date: str | None = None) -> dict[str, Any]:
+    today = date.today()
+    begin_date = begin_date or f"{today.year}-{today.month:02d}-01"
+    end_date = end_date or f"{today.year}-{today.month:02d}-{monthrange(today.year, today.month)[1]:02d}"
+    hmis_rows = maternal_report_rows(begin_date, end_date)
+    values = {row["hmis_code"]: row["number"] for row in hmis_rows}
+    payloads = rh_payloads()
+    period_cards = []
+    for card in payloads:
+        sections = card.get("sections") or {}
+        anc = sections.get("anc") or {}
+        delivery = sections.get("delivery") or {}
+        postpartum = sections.get("postpartum") or {}
+        notification = sections.get("birth_notification") or {}
+        dates = [str(v) for k, v in anc.items() if k.endswith("Date of contact") and begin_date <= str(v) <= end_date]
+        delivery_date = notification.get("birth_date") or delivery.get("delivery_date") or ""
+        if delivery_date and begin_date <= str(delivery_date) <= end_date:
+            dates.append(str(delivery_date))
+        dates.extend(str(v) for k, v in postpartum.items() if k.endswith("Date") and begin_date <= str(v) <= end_date)
+        if dates:
+            period_cards.append({"id": card.get("id"), "client_name": card.get("client_name"), "mrn": card.get("mrn"), "anc_reg_no": card.get("anc_reg_no"), "edd": card.get("edd"), "last_activity": max(dates)})
+    summary = {
+        "anc1": values.get("MAT_ANC1_GA.1", 0),
+        "anc4": values.get("MAT_ANC4+_GA.1", 0),
+        "anc8": values.get("MAT_ANC8+", 0),
+        "live_births": values.get("MAT_SBR.LB", 0),
+        "skilled_births": values.get("MAT_SBA.1", 0),
+        "early_pnc": values.get("MAT_EPNC.1", 0),
+    }
+    return {"begin_date": begin_date, "end_date": end_date, "records": len(period_cards), "summary": summary, "hmis_rows": hmis_rows, "recent_records": sorted(period_cards, key=lambda x: x["last_activity"], reverse=True)[:20]}
 
 
 @app.get("/api/reports/anc")

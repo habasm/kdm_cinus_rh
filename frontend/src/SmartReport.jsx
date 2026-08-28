@@ -1,5 +1,58 @@
 import {useEffect,useMemo,useState} from 'react'
+
 const api=async p=>{const r=await fetch('/api'+p),t=await r.text();let d;try{d=JSON.parse(t)}catch{}if(!r.ok)throw new Error(d?.detail||t);return d}
 const monthEnd=m=>{const[y,n]=m.split('-').map(Number);return m+'-'+String(new Date(y,n,0).getDate()).padStart(2,'0')}
 const total=(group,key)=>group?Object.values(group).reduce((n,x)=>n+(x[key]||0),0):0
-export default function SmartReport({month,setMonth}){const[start,setStart]=useState(month+'-01'),[end,setEnd]=useState(monthEnd(month)),[report,setReport]=useState(null),[visits,setVisits]=useState([]),[query,setQuery]=useState(''),[page,setPage]=useState(1),[busy,setBusy]=useState(false),size=6;useEffect(()=>{setBusy(true);Promise.all([api('/cinus-tally?month='+month+'&begin_date='+start+'&end_date='+end),api('/visits')]).then(([r,v])=>{setReport(r);setVisits(v)}).finally(()=>setBusy(false))},[month,start,end]);const filtered=useMemo(()=>visits.filter(v=>v.visit_date>=start&&v.visit_date<=end&&(v.first_name+' '+v.last_name+' '+v.child_code+' '+(v.nutrition_result||'')).toLowerCase().includes(query.toLowerCase())),[visits,start,end,query]),pages=Math.max(1,Math.ceil(filtered.length/size)),rows=filtered.slice((page-1)*size,page*size),t=report?.tally||{},normal=total(t.screen,'normal'),mam=total(t.screen,'mam'),sam=total(t.screen,'sam'),vitamin=total(t.vitamin,'one')+total(t.vitamin,'two'),dev=total(t.development,'ndd')+total(t.development,'sdd')+total(t.development,'cdd');useEffect(()=>setPage(1),[query,start,end]);const changeMonth=e=>{const m=e.target.value;setMonth(m);setStart(m+'-01');setEnd(monthEnd(m))};return <div className="report-workspace"><section className="panel report-toolbar"><div><p className="eyebrow">REPORT PERIOD</p><h3>Official CINUS tally</h3></div><label><span>Start date</span><input type="date" value={start} onChange={e=>setStart(e.target.value)}/></label><label><span>End date</span><input type="date" value={end} onChange={e=>setEnd(e.target.value)}/></label><label><span>Month</span><input type="month" value={month} onChange={changeMonth}/></label><a className="primary download" href={'/api/cinus-tally/pdf?month='+month+'&begin_date='+start+'&end_date='+end+'&region=Amhara&woreda=Bahir%20Dar&facility=Kidanemihiret'}>Generate PDF ↓</a></section><section className="summary-grid"><article><span>Visits included</span><b>{report?.records||0}</b><small>{start} to {end}</small></article><article className="good"><span>Normal screening</span><b>{normal}</b><small>{normal+mam+sam?Math.round(normal/(normal+mam+sam)*100):0}% of screenings</small></article><article className="warn"><span>MAM</span><b>{mam}</b><small>Moderate acute malnutrition</small></article><article className="danger"><span>SAM</span><b>{sam}</b><small>Requires priority follow-up</small></article><article><span>Vitamin A services</span><b>{vitamin}</b><small>First and second doses</small></article><article><span>Development screened</span><b>{dev}</b><small>NDD, SDD and CDD</small></article></section><section className="panel report-records"><div className="records-head"><div><p className="eyebrow">DATABASE RECORDS</p><h3>{filtered.length} matching visits</h3></div><div className="report-search"><span>⌕</span><input placeholder="Search child, CIN code or result" value={query} onChange={e=>setQuery(e.target.value)}/></div></div>{busy?<div className="loading-row">Refreshing report data…</div>:<div className="table-scroll"><table><thead><tr><th>Child</th><th>Visit date</th><th>Age</th><th>WAZ / status</th><th>Nutrition</th><th>Development</th></tr></thead><tbody>{rows.map(v=><tr key={v.id}><td><b>{v.first_name} {v.last_name}</b><small>{v.child_code}</small></td><td>{v.visit_date}</td><td>{v.age_months} months</td><td>{v.waz??'—'}<small>{v.underweight_status}</small></td><td><span className={'status '+(v.nutrition_result||'')}>{(v.nutrition_result||'—').toUpperCase()}</span></td><td>{(v.developmental_result||'—').toUpperCase()}</td></tr>)}{!rows.length&&<tr><td colSpan="6" className="empty-table">No records match this period and search.</td></tr>}</tbody></table></div>}<div className="pagination"><span>Page {page} of {pages}</span><div><button disabled={page===1} onClick={()=>setPage(page-1)}>← Previous</button>{Array.from({length:pages},(_,i)=>i+1).slice(Math.max(0,page-3),Math.max(5,page+2)).map(n=><button className={n===page?'active':''} key={n} onClick={()=>setPage(n)}>{n}</button>)}<button disabled={page===pages} onClick={()=>setPage(page+1)}>Next →</button></div></div></section></div>}
+const params=(month,start,end)=>'month='+month+'&begin_date='+start+'&end_date='+end+'&region=Amhara&woreda=Bahir%20Dar&facility=Kidanemihiret'
+
+export default function SmartReport({month,setMonth}){
+ const[start,setStart]=useState(month+'-01'),[end,setEnd]=useState(monthEnd(month)),[report,setReport]=useState(null),[visits,setVisits]=useState([]),[query,setQuery]=useState(''),[page,setPage]=useState(1),[busy,setBusy]=useState(false),[view,setView]=useState('hmis'),size=6
+ useEffect(()=>{setBusy(true);Promise.all([api('/cinus-tally?'+params(month,start,end)),api('/visits')]).then(([r,v])=>{setReport(r);setVisits(v)}).finally(()=>setBusy(false))},[month,start,end])
+ const filtered=useMemo(()=>visits.filter(v=>v.visit_date>=start&&v.visit_date<=end&&(v.first_name+' '+v.last_name+' '+v.child_code+' '+(v.nutrition_result||'')).toLowerCase().includes(query.toLowerCase())),[visits,start,end,query])
+ const pages=Math.max(1,Math.ceil(filtered.length/size)),rows=filtered.slice((page-1)*size,page*size),t=report?.tally||{},hmis=report?.hmis_rows||[]
+ const normal=total(t.screen,'normal'),mam=total(t.screen,'mam'),sam=total(t.screen,'sam'),vitamin=total(t.vitamin,'one')+total(t.vitamin,'two'),dev=total(t.development,'ndd')+total(t.development,'sdd')+total(t.development,'cdd')
+ const pending=hmis.filter(r=>r.status==='Needs maternal source'),ready=hmis.filter(r=>r.status==='Ready'),preview=hmis.filter(r=>r.status!=='Heading').slice(0,10)
+ useEffect(()=>setPage(1),[query,start,end])
+ const changeMonth=e=>{const m=e.target.value;setMonth(m);setStart(m+'-01');setEnd(monthEnd(m))}
+ return <div className="report-workspace">
+  <section className="panel report-toolbar">
+   <div><p className="eyebrow">REPORT PERIOD</p><h3>Official CINUS tally</h3></div>
+   <label><span>Start date</span><input type="date" value={start} onChange={e=>setStart(e.target.value)}/></label>
+   <label><span>End date</span><input type="date" value={end} onChange={e=>setEnd(e.target.value)}/></label>
+   <label><span>Month</span><input type="month" value={month} onChange={changeMonth}/></label>
+   <details className="download-menu"><summary>Download resources</summary><div><a href={'/api/cinus-tally/pdf?'+params(month,start,end)}>PDF report</a><a href={'/api/cinus-tally/excel?'+params(month,start,end)}>Excel workbook</a></div></details>
+  </section>
+  <section className="summary-grid">
+   <article><span>Visits included</span><b>{report?.records||0}</b><small>{start} to {end}</small></article>
+   <article className="good"><span>Normal screening</span><b>{normal}</b><small>{normal+mam+sam?Math.round(normal/(normal+mam+sam)*100):0}% of screenings</small></article>
+   <article className="warn"><span>MAM</span><b>{mam}</b><small>Moderate acute malnutrition</small></article>
+   <article className="danger"><span>SAM</span><b>{sam}</b><small>Requires priority follow-up</small></article>
+   <article><span>Vitamin A services</span><b>{vitamin}</b><small>First and second doses</small></article>
+   <article><span>Development screened</span><b>{dev}</b><small>NDD, SDD and CDD</small></article>
+  </section>
+  <div className="report-subtabs" role="tablist"><button className={view==='hmis'?'active':''} onClick={()=>setView('hmis')}>HMIS report preview</button><button className={view==='records'?'active':''} onClick={()=>setView('records')}>Source table</button></div>
+  {view==='hmis'&&<section className="panel report-considerations compact-report-panel">
+   <div className="records-head">
+    <div><p className="eyebrow">HMIS REPORT CONSIDERATIONS</p><h3>{ready.length} ready rows · {pending.length} maternal-source rows</h3></div>
+    <span className="tag">From Child_Report_form</span>
+   </div>
+   <div className="consideration-grid">
+    {preview.map(row=><article key={row.hmis_code} className={row.status==='Needs maternal source'?'pending-source':''}>
+     <span>{row.hmis_code}</span><b>{row.number===''?'-':row.number}</b><small>{row.activity}</small><em>{row.status}</em>
+    </article>)}
+   </div>
+   {pending.length>0&&<div className="pending-source-list">
+    <b>Needs maternal/RH source in the next step</b>
+   <span>{pending.map(r=>r.hmis_code).join(', ')}</span>
+   </div>}
+  </section>}
+  {view==='records'&&<section className="panel report-records compact-report-panel">
+   <div className="records-head">
+    <div><p className="eyebrow">DATABASE RECORDS</p><h3>{filtered.length} matching visits</h3></div>
+    <div className="report-search"><span>⌕</span><input placeholder="Search child, CIN code or result" value={query} onChange={e=>setQuery(e.target.value)}/></div>
+   </div>
+   {busy?<div className="loading-row">Refreshing report data...</div>:<div className="table-scroll"><table><thead><tr><th>Child</th><th>Visit date</th><th>Age</th><th>WAZ / status</th><th>Nutrition</th><th>Development</th></tr></thead><tbody>{rows.map(v=><tr key={v.id}><td><b>{v.first_name} {v.last_name}</b><small>{v.child_code}</small></td><td>{v.visit_date}</td><td>{v.age_months} months</td><td>{v.waz??'-'}<small>{v.underweight_status}</small></td><td><span className={'status '+(v.nutrition_result||'')}>{(v.nutrition_result||'-').toUpperCase()}</span></td><td>{(v.developmental_result||'-').toUpperCase()}</td></tr>)}{!rows.length&&<tr><td colSpan="6" className="empty-table">No records match this period and search.</td></tr>}</tbody></table></div>}
+   <div className="pagination"><span>Page {page} of {pages}</span><div><button disabled={page===1} onClick={()=>setPage(page-1)}>← Previous</button>{Array.from({length:pages},(_,i)=>i+1).slice(Math.max(0,page-3),Math.max(5,page+2)).map(n=><button className={n===page?'active':''} key={n} onClick={()=>setPage(n)}>{n}</button>)}<button disabled={page===pages} onClick={()=>setPage(page+1)}>Next →</button></div></div>
+  </section>}
+ </div>
+}
